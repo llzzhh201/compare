@@ -38,7 +38,7 @@ import (
 	"github.com/fission/fission/pkg/crd"
 	ferror "github.com/fission/fission/pkg/error"
 	"github.com/fission/fission/pkg/error/network"
-	eclient "github.com/fission/fission/pkg/executor/client"
+	executorClient "github.com/fission/fission/pkg/executor/client"
 	"github.com/fission/fission/pkg/throttler"
 	"github.com/fission/fission/pkg/utils"
 	otelUtils "github.com/fission/fission/pkg/utils/otel"
@@ -56,7 +56,7 @@ type (
 	functionHandler struct {
 		logger                   *zap.Logger
 		fmap                     *functionServiceMap
-		executor                 eclient.ClientInterface
+		executor                 *executorClient.Client
 		function                 *fv1.Function
 		httpTrigger              *fv1.HTTPTrigger
 		functionMap              map[string]*fv1.Function
@@ -110,6 +110,11 @@ type (
 		cacheHit bool
 	}
 )
+
+func init() {
+	// just seeding the random number for getting the canary function
+	rand.Seed(time.Now().UnixNano())
+}
 
 func (w *fakeCloseReadCloser) Close() error {
 	return nil
@@ -210,7 +215,7 @@ func (roundTripper *RetryingRoundTripper) RoundTrip(req *http.Request) (*http.Re
 			logger.Debug("round tripper response", zap.String("response", string(respMsg)))
 		}
 	}
-
+    svcType:=fv1.SVCTypeName
 	for i := 0; i < roundTripper.funcHandler.tsRoundTripperParams.maxRetries; i++ {
 		// set service url of target service of request only when
 		// trying to get new service url from cache/executor.
@@ -219,7 +224,12 @@ func (roundTripper *RetryingRoundTripper) RoundTrip(req *http.Request) (*http.Re
 				"function-name":      fnMeta.Name,
 				"function-namespace": fnMeta.Namespace})...)
 			// get function service url from cache or executor
-			roundTripper.serviceURL, roundTripper.urlFromCache, err = roundTripper.funcHandler.getServiceEntry(ctx)
+			if svcType==fv1.SVCTypeName{
+				roundTripper.serviceURL, roundTripper.urlFromCache, svcType,err = roundTripper.funcHandler.getServiceEntry(ctx,fv1.SVCTypeName)
+			}else{
+				roundTripper.serviceURL, roundTripper.urlFromCache, svcType,err = roundTripper.funcHandler.getServiceEntry(ctx,fv1.SVCTypePodIP)
+			}
+			
 			if err != nil {
 				// We might want a specific error code or header for fission failures as opposed to
 				// user function bugs.
@@ -253,7 +263,7 @@ func (roundTripper *RetryingRoundTripper) RoundTrip(req *http.Request) (*http.Re
 				"service-entry":      roundTripper.serviceURL.String()})...)
 			if roundTripper.funcHandler.function.Spec.InvokeStrategy.ExecutionStrategy.ExecutorType == fv1.ExecutorTypePoolmgr {
 				defer func(ctx context.Context, fn *fv1.Function, serviceURL *url.URL) {
-					go roundTripper.funcHandler.unTapService(context.Background(), fn, serviceURL) //nolint errcheck
+					go roundTripper.funcHandler.unTapService(fn, serviceURL) //nolint errcheck
 				}(ctx, roundTripper.funcHandler.function, roundTripper.serviceURL)
 			}
 
@@ -261,7 +271,6 @@ func (roundTripper *RetryingRoundTripper) RoundTrip(req *http.Request) (*http.Re
 			// this service url comes from executor response
 			req.URL.Scheme = roundTripper.serviceURL.Scheme
 			req.URL.Host = roundTripper.serviceURL.Host
-
 			// With addition of routing support from functions if function supports routing,
 			// 1. we trim prefix url and forward request
 			// 2. otherwise we just keep default request to root path
@@ -295,6 +304,8 @@ func (roundTripper *RetryingRoundTripper) RoundTrip(req *http.Request) (*http.Re
 			// or request will be blocked in some situations
 			// (e.g. istio-proxy)
 			req.Host = roundTripper.serviceURL.Host
+			// req.Host =  podAddress.Host
+			logger.Info("+++++********service url is ", zap.String("serviceURL", req.URL.Host))
 		}
 
 		// over-riding default settings.
@@ -366,7 +377,7 @@ func (roundTripper *RetryingRoundTripper) RoundTrip(req *http.Request) (*http.Re
 			retryCounter++
 		}
 
-		// If it's not a timeout error or retryCounter exceeded pre-defined threshold,
+		// If it's not a timeout error or retryCounter exceeded pre-defined threshold,每个地址只试5次
 		if retryCounter >= roundTripper.funcHandler.tsRoundTripperParams.svcAddrRetryCount {
 			logger.Debug(fmt.Sprintf(
 				"retry counter exceeded pre-defined threshold of %v",
@@ -415,7 +426,7 @@ func (roundTripper *RetryingRoundTripper) setContext(req *http.Request) *http.Re
 	// that user aborts connection before timeout. Otherwise,
 	// the request won't be canceled until the deadline exceeded
 	// which may be a potential security issue.
-	ctx, closeCtx := context.WithTimeoutCause(req.Context(), roundTripper.funcTimeout, fmt.Errorf("roundtripper timeout (%f)s exceeded", roundTripper.funcTimeout.Seconds()))
+	ctx, closeCtx := context.WithTimeout(req.Context(), roundTripper.funcTimeout)
 	roundTripper.closeContextFunc = &closeCtx
 
 	return req.WithContext(ctx)
@@ -579,9 +590,9 @@ func (roundTripper RetryingRoundTripper) addForwardedHostHeader(req *http.Reques
 }
 
 // unTapservice marks the serviceURL in executor's cache as inactive, so that it can be reused
-func (fh functionHandler) unTapService(ctx context.Context, fn *fv1.Function, serviceUrl *url.URL) error {
+func (fh functionHandler) unTapService(fn *fv1.Function, serviceUrl *url.URL) error {
 	fh.logger.Debug("UnTapService Called")
-	ctx, cancel := context.WithTimeoutCause(ctx, fh.unTapServiceTimeout, fmt.Errorf("unTapService timeout (%f)s exceeded", fh.unTapServiceTimeout.Seconds()))
+	ctx, cancel := context.WithTimeout(context.Background(), fh.unTapServiceTimeout)
 	defer cancel()
 	err := fh.executor.UnTapService(ctx, fn.ObjectMeta, fn.Spec.InvokeStrategy.ExecutionStrategy.ExecutorType, serviceUrl)
 	if err != nil {
@@ -618,10 +629,33 @@ func (fh functionHandler) getServiceEntryFromCache() (serviceUrl *url.URL, err e
 	}
 	return serviceUrl, nil
 }
+// getPodIPEntryFromCache returns pod ip url entry returns from cache
+func (fh functionHandler) getPodIPEntryFromCache() (podUrl *url.URL, err error) {
+	// cache lookup to get serviceUrl
+	podUrl, err = fh.fmap.lookuppodip(string(fh.function.UID))
+	if err != nil {
+		var errMsg string
+
+		e, ok := err.(ferror.Error)
+		if !ok {
+			errMsg = fmt.Sprintf("Unknown error when looking up service entry: %v", err)
+		} else {
+			// Ignore ErrorNotFound error here, it's an expected error,
+			// roundTripper will try to get service url later.
+			if e.Code == ferror.ErrorNotFound {
+				return nil, nil
+			}
+			errMsg = fmt.Sprintf("Error getting function %v;s pod ip service entry from cache: %v", fh.function.ObjectMeta.Name, err)
+		}
+		return nil, ferror.MakeError(http.StatusInternalServerError, errMsg)
+	}
+	return podUrl, nil
+}
 
 // addServiceEntryToCache add service url entry to cache
-func (fh functionHandler) addServiceEntryToCache(serviceURL *url.URL) {
+func (fh functionHandler) addServiceEntryToCache(serviceURL *url.URL,podURL *url.URL) {
 	fh.fmap.assign(&fh.function.ObjectMeta, serviceURL)
+	fh.fmap.assignpodip(string(fh.function.UID), podURL)
 }
 
 // removeServiceEntryFromCache removes service url entry from cache
@@ -630,9 +664,13 @@ func (fh functionHandler) removeServiceEntryFromCache() {
 	if err != nil {
 		fh.logger.Error("Error removing key:", zap.Error(err))
 	}
+	err = fh.fmap.removepodip(string(fh.function.UID))
+	if err != nil {
+		fh.logger.Error("Error removing pod ip key:", zap.Error(err))
+	}
 }
 
-func (fh functionHandler) getServiceEntryFromExecutor(ctx context.Context) (serviceUrl *url.URL, err error) {
+func (fh functionHandler) getServiceEntryFromExecutor(ctx context.Context) (serviceUrl *url.URL, PodUrl *url.URL,err error) {
 	logger := otelUtils.LoggerWithTraceID(ctx, fh.logger)
 	// send a request to executor to specialize a new pod
 	fh.logger.Debug("function timeout specified", zap.Int("timeout", fh.function.Spec.FunctionTimeout))
@@ -640,14 +678,14 @@ func (fh functionHandler) getServiceEntryFromExecutor(ctx context.Context) (serv
 	var fContext context.Context
 	if fh.function.Spec.FunctionTimeout > 0 {
 		timeout := time.Second * time.Duration(fh.function.Spec.FunctionTimeout)
-		f, cancel := context.WithTimeoutCause(ctx, timeout, fmt.Errorf("function service entry timeout (%f)s exceeded", timeout.Seconds()))
+		f, cancel := context.WithTimeout(ctx, timeout)
 		fContext = f
 		defer cancel()
 	} else {
 		fContext = ctx
 	}
 
-	service, err := fh.executor.GetServiceForFunction(fContext, fh.function)
+	address, err := fh.executor.GetServiceForFunction(fContext, fh.function)
 	if err != nil {
 		statusCode, errMsg := ferror.GetHTTPError(err)
 		logger.Error("error from GetServiceForFunction",
@@ -655,49 +693,85 @@ func (fh functionHandler) getServiceEntryFromExecutor(ctx context.Context) (serv
 			zap.String("error_message", errMsg),
 			zap.Any("function", fh.function),
 			zap.Int("status_code", statusCode))
-		return nil, err
+		return nil, nil,err
 	}
 	// parse the address into url
-	svcURL, err := url.Parse(fmt.Sprintf("http://%v", service))
+    result := strings.Split(address, ",")
+	if len(result)<1{
+		logger.Error("error getting service url, len of addres should equal 2",
+			zap.Error(err))
+		return nil, nil,err
+	}
+	svcURL, err := url.Parse(fmt.Sprintf("http://%v", result[0]))
 	if err != nil {
 		logger.Error("error parsing service url",
 			zap.Error(err),
 			zap.String("service_url", svcURL.String()))
-		return nil, err
+		return nil, nil,err
 	}
-	return svcURL, err
+	if len(result)==2&&result[1]!=""{
+		PodUrl,err= url.Parse(fmt.Sprintf("http://%v", result[1]))
+		if err != nil {
+			logger.Error("error parsing Pod url",
+				zap.Error(err),
+				zap.String("service_url", PodUrl.String()))
+			return nil, nil,err
+		}
+		return svcURL, PodUrl,err
+	}
+	return svcURL, svcURL,err
 }
 
 // getServiceEntryFromExecutor returns service url entry returns from executor
-func (fh functionHandler) getServiceEntry(ctx context.Context) (svcURL *url.URL, cacheHit bool, err error) {
+func (fh functionHandler) getServiceEntry(ctx context.Context,serviceType string) (svcURL *url.URL,cacheHit bool,svcType string,err error) {
+	var svc *url.URL
 	if fh.function.Spec.InvokeStrategy.ExecutionStrategy.ExecutorType == fv1.ExecutorTypePoolmgr {
-		svcURL, err = fh.getServiceEntryFromExecutor(ctx)
-		return svcURL, false, err
+		svcURL,_,err = fh.getServiceEntryFromExecutor(ctx)
+		return svcURL,false,fv1.SVCTypeName, err
 	}
+	firstTime:=false
 	// Check if service URL present in cache
 	svcURL, err = fh.getServiceEntryFromCache()
-	if err == nil && svcURL != nil {
-		return svcURL, true, nil
+	if err == nil {
+		if svcURL != nil {
+			if serviceType==fv1.SVCTypeName{
+				return svcURL,  true, fv1.SVCTypeName,nil
+			}else{
+				firstTime=false
+			}
+		}else {
+			firstTime=true
+			serviceType=fv1.SVCTypePodIP
+		}		
 	} else if err != nil {
-		return nil, false, err
+		return nil,  false, fv1.SVCTypeName,err
+	}
+
+	if serviceType==fv1.SVCTypePodIP && firstTime!=true{
+		svcURL, err := fh.getPodIPEntryFromCache()
+		if err != nil {
+			return nil, false,fv1.SVCTypeName,err
+		}else{
+			return svcURL,true,fv1.SVCTypePodIP,err
+		}
 	}
 
 	fnMeta := &fh.function.ObjectMeta
 	recordObj, err := fh.svcAddrUpdateThrottler.RunOnce(
-		crd.CacheKeyURFromMeta(fnMeta).String(),
+		crd.CacheKey(fnMeta),
 		func(firstToTheLock bool) (interface{}, error) {
 			if !firstToTheLock {
-				svcURL, err := fh.getServiceEntryFromCache()
+				svcURL, err := fh.getPodIPEntryFromCache()
 				if err != nil {
 					return nil, err
 				}
 				return svcEntryRecord{svcURL: svcURL, cacheHit: true}, err
 			}
-			svcURL, err = fh.getServiceEntryFromExecutor(ctx)
+			svc, svcURL,err = fh.getServiceEntryFromExecutor(ctx)
 			if err != nil {
 				return nil, err
 			}
-			fh.addServiceEntryToCache(svcURL)
+			fh.addServiceEntryToCache(svc,svcURL)
 			return svcEntryRecord{
 				svcURL:   svcURL,
 				cacheHit: false,
@@ -705,15 +779,11 @@ func (fh functionHandler) getServiceEntry(ctx context.Context) (svcURL *url.URL,
 		},
 	)
 
-	if recordObj == nil {
-		return nil, false, fmt.Errorf("empty service entry: %w", err)
-	}
-
 	record, ok := recordObj.(svcEntryRecord)
 	if !ok {
-		return nil, false, fmt.Errorf("unexpected type of recordObj %T: %w", recordObj, err)
+		return nil, false, fv1.SVCTypePodIP,fmt.Errorf("unexpected type of recordObj %T: %w", recordObj, err)
 	}
-	return record.svcURL, record.cacheHit, err
+	return record.svcURL, record.cacheHit, fv1.SVCTypePodIP,err
 }
 
 // getProxyErrorHandler returns a reverse proxy error handler
